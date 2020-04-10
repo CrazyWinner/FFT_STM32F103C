@@ -1,3 +1,12 @@
+/**
+ * Author:    Mertcan Özdemir
+ * Created:   10.04.2020
+ * 
+ * STM32F103C Guitar tuner with fake multitasking(Async sampling)
+ * 
+ * (c) Copyright by Mertcan Özdemir
+ **/
+
 #include <SpeedTrig.h> 
 #include <U8g2lib.h>
 #ifdef U8X8_HAVE_HW_SPI
@@ -17,13 +26,13 @@
 #define BUTTON_PIN PA2
 #define MOTOR_A PA6
 #define MOTOR_B PA7
-#define SAMPLE_SIZE 1024 // Saniyede alınan örnek sayısı(sabit değil)
-#define SAMPLING_SIZE 256 // Her 256 örnekte bir fft gerçekleştir
-#define FREQ_WINDOW 15 // Notaları +-15 Hz aralığında ara
+#define SAMPLE_SIZE 1024 // Samples per second
+#define SAMPLING_SIZE 256 // Do fft every 256 samples
+#define FREQ_WINDOW 15 // Scan notes in +-15 hz
 #define FREQ_WINDOW_GROW 3
 #define FREQ_SLOWDOWN_FACTOR 5
 
-class Complex{   // Complex sayı class'ı 
+class Complex{   //Complex number class
   public: 
     float real;
     float img;
@@ -31,63 +40,64 @@ class Complex{   // Complex sayı class'ı
       real = 0;
       img  = 0;
       }
-    void fromAngle(float aci){  // açıdan kompleks sayı oluştur
+    void fromAngle(float aci){  // Create complex number from angle
      
       this->real = SpeedTrig.cos(aci/PI*180);
       this->img  = SpeedTrig.sin(aci/PI*180);
       }  
-    Complex(float initialR, float initialI){ // a+bi'den kompleks sayı oluştur
+    Complex(float initialR, float initialI){ // Create complex number from a+bi
       this->real = initialR;
       this->img  = initialI;
       } 
-    void times(Complex c){   // c kompleks sayısı ile çarp
+    void times(Complex c){   // Multiply by c
       float yedekReal = this->real;
       
       this->real = this->real * c.real - this->img * c.img;
       this->img  = yedekReal * c.img  + this->img * c.real;
       }
-    void equal(Complex c){  // c kompleks sayısına eşitle
+    void equal(Complex c){  // Equal to complex number
       this->real = c.real;
       this->img  = c.img;
       }
-    void plus(Complex c){ // c kompleks sayısı ile topla
+    void plus(Complex c){ // Sum with complex number
       this->real = this->real + c.real;
       this->img  = this->img  + c.img;
       } 
-     void set(float initialR, float initialI){ // a+bi'ye eşitle
+     void set(float initialR, float initialI){ // Set real and imaginal parts of complex number
       this->real = initialR;
       this->img  = initialI;
       }
-     void minus(Complex c){ // c kompleks sayısını çıkar
+     void minus(Complex c){ // Subtract with complex number
       this->real = this->real - c.real;
       this->img  = this->img  - c.img;
       } 
   
   };
 
-byte adaptiveSampleRate = 2;
+byte adaptiveSampleRate = 2; // Changing sampling frequency based on note, first two notes sampling frequency is 512 hz
+//For other notes sampling frequency is 1024 hz
 long buttonHoldCounter;
-float frekans = 0; // Bulunan frekans
-boolean isScreenChanged = true; // Ekranda değişiklik var mı
-long screenSayac = 0; // Nota adı göstermek için sayaç 
-byte screenMode = 0; // Nota adı ve frekans grafiği arasında mod seçimi
+float frekans = 0; // Frequency variable
+boolean isScreenChanged = true; // Did screen change
+long screenSayac = 0; // Counter for screen events
+byte screenMode = 0; 
 U8G2_PCD8544_84X48_F_4W_SW_SPI u8g2(U8G2_R0, /* clock=*/ CLK, /* data=*/ DIN, /* cs=*/ CE, /* dc=*/ DC, /* reset=*/ RST);  // Nokia 5110 Display
-long sayac = 0; // çeşitli görevler için sayaç
-float notaFrekans [] = {82.5,110,147,196,247,330}; //sırayla notaların frekansları
-int seciliNota = 0; // şu an seçili olan nota
-Complex sinyal[SAMPLE_SIZE]; //fft çıkışı için kompleks sayı dizisi 
-int sample[SAMPLE_SIZE]; //fft girişi için dizi
-int sampling[SAMPLING_SIZE]; //Interrupt'ın sinyali yazacağı dizi
-int sampling_counter = 0; //En son kaçıncı örnek yazıldı
-Complex yedek; //Çeşitli görevler için yedek kompleks sayı
-Complex omega; //fft'de kullanılan omega
-int bitSayisi; //Giriş sinyalini kaç bit ile gösterebiliriz
-boolean FFTavailable = false; // Yeterli örnek sayısına ulaşıldı mı
-boolean readyToOperate = false;
-boolean isSet = false;
-long freqCounter = 0;
+long sayac = 0; // Counter for various events
+float notaFrekans [] = {82.5,110,147,196,247,330}; // Guitar note frequencies
+int seciliNota = 0; // Selected note to tune 0:E2, 1:A2, 2:D3, 3:G3, 4:B3, 5:E4
+Complex sinyal[SAMPLE_SIZE]; // Output array for fft
+int sample[SAMPLE_SIZE]; // Input array for fft
+int sampling[SAMPLING_SIZE]; // Async sampled data
+int sampling_counter = 0; // Async sample counter
+Complex yedek; // Variable for various duties
+Complex omega; // Variable for w
+int bitSayisi; // Bit length of samples
+boolean FFTavailable = false; // Did async sampling finish
+boolean readyToOperate = false; // Ready to turn the motor
+boolean isSet = false; // Note frequency set
+long freqCounter = 0; 
 
-extern const uint8_t welcome_animation[11][528] PROGMEM;
+extern const uint8_t welcome_animation[11][528] PROGMEM; // Animation array
 
 
  
@@ -95,18 +105,18 @@ extern const uint8_t welcome_animation[11][528] PROGMEM;
 
 void setup() {
 //Serial.begin(500000);
-pinMode(MIC_IN,INPUT); 
-pinMode(MOTOR_A,OUTPUT);
+pinMode(MIC_IN,INPUT);  // Mic in with 1.66v offset
+pinMode(MOTOR_A,OUTPUT); 
 pinMode(MOTOR_B,OUTPUT);
  u8g2.begin();
 pinMode(BUTTON_PIN,INPUT_PULLUP);
 
 
 
-bitSayisi = kacBit(SAMPLE_SIZE); //fft girişi kaç bit, bit ters çevirme işleminde işe yarayacak
+bitSayisi = kacBit(SAMPLE_SIZE); // Find out bit length of samples
 yedek = Complex();
 omega = Complex();
-  initTimerInterrupt();
+  initTimerInterrupt();  // Start async sampling
   for(int i = 0; i < 11; i++){
       u8g2.clearBuffer();
       u8g2.drawBitmap(0,0,11,48,welcome_animation[i]);
@@ -120,7 +130,7 @@ omega = Complex();
 
 
 
-void initTimerInterrupt(){   //976 mikrosaniyede bir tetiklenen interruptı hazırla
+void initTimerInterrupt(){   // Creating the interrupt
   Timer2.pause();
   Timer2.setPeriod(1952);
   Timer2.setChannel1Mode(TIMER_OUTPUT_COMPARE);
@@ -130,11 +140,11 @@ void initTimerInterrupt(){   //976 mikrosaniyede bir tetiklenen interruptı haz�
   }
 
 
-void changeSampleRate(int multiplier){
+void changeSampleRate(int multiplier){           // Change between 1024 and 512 hz sampling frequency
   if(multiplier != adaptiveSampleRate){
     Timer2.pause();
     Timer2.setPeriod((multiplier == 1)? 976 : 1952);
-    for(int i = 0; i < SAMPLE_SIZE; i++){
+    for(int i = 0; i < SAMPLE_SIZE; i++){        // If sampling frequency changed clear all of the previous samples
       sample[i] = 0;
       }
         Timer2.refresh();
@@ -145,23 +155,23 @@ void changeSampleRate(int multiplier){
   }
  
 void loop() {
-if(FFTavailable){  //Yeterli örnek sayısına ulaşıldı ise fft'yi gerçekleştir
+if(FFTavailable){  // Did interrupt take enough sample
   FFTavailable = false;
    long a = millis();
-   FFT(); // FFT fonksiyonu
+   FFT(); // Do the fft
   // Serial.print("FFT done, elapsed time:");
   // Serial.println(millis()-a);
   }
-  if(isScreenChanged){ //Ekranda değişiklik varsa ekranı yeniden çizdir
+  if(isScreenChanged){ // If screen changed, draw again
   drawScreen();
   isScreenChanged = false;
   }
-  if(screenMode == 1 && millis() - screenSayac > 1000){ // Seçilen notayı ekranda 1000 ms gösterdikten sonra ekranı eski haline getir
+  if(screenMode == 1 && millis() - screenSayac > 1000){ // If note changed show the new note for 1000ms 
     screenMode = 0;
     isScreenChanged = true;
     }
 
-if(frekans == notaFrekans[seciliNota] && readyToOperate){
+if(frekans == notaFrekans[seciliNota] && readyToOperate){  // If frequency is stable enough(for 500 ms) note is set
   if(millis() - freqCounter > 500)
   {
     isSet = true;
@@ -172,7 +182,7 @@ if(frekans == notaFrekans[seciliNota] && readyToOperate){
     }
 
 
-if(frekans!=0 && readyToOperate && !isSet){
+if(frekans!=0 && readyToOperate && !isSet){           //Turn the motor according to frequency
   if(frekans > notaFrekans[seciliNota]){
     analogWrite(MOTOR_A,getSpeedValue(frekans - notaFrekans[seciliNota]));
     analogWrite(MOTOR_B,0);
@@ -188,9 +198,11 @@ if(frekans!=0 && readyToOperate && !isSet){
       analogWrite(MOTOR_A,0);
     analogWrite(MOTOR_B,0);
     }
-    if(digitalRead(BUTTON_PIN) == 0){
+
+    
+    if(digitalRead(BUTTON_PIN) == 0){        //Detect button press and hold
       if(millis()- buttonHoldCounter > 1000 && millis() - buttonHoldCounter < 2000){
-        changeNota();
+        changeNota();                     // If button holded for 1 seconds change the selected note
         buttonHoldCounter -= 1000;
         }
     }else{
@@ -201,14 +213,15 @@ if(frekans!=0 && readyToOperate && !isSet){
 }
 
 
-int getSpeedValue(int fark){  
+int getSpeedValue(int fark){   // Change speed of motor according to note and how close the frequency is
   if(fark < notaFrekans[seciliNota]*0.03){ if(seciliNota < 3){return 120 - FREQ_SLOWDOWN_FACTOR * (seciliNota+2);}else{
     return 120 - FREQ_SLOWDOWN_FACTOR * (seciliNota+4);
     }};
   return 145;
   }
 
-int bitReverse(int a){  // Verilen sayının bitlerini ters çevir
+
+int bitReverse(int a){  // Reversing the bit order for fft
   int reversed = 0;
   for(int i = 0; i < bitSayisi-1; i++){
 
@@ -221,11 +234,12 @@ int bitReverse(int a){  // Verilen sayının bitlerini ters çevir
   }
 
 
-void drawScreen(){ 
-  u8g2.clearBuffer();// Ekranı temizle
+
+void drawScreen(){    // Screen drawing
+  u8g2.clearBuffer();// Clear Screen
 
   
-  if(screenMode == 0){ // Eğer ekran frekans gösterme modunda ise göstergeyi çizdir
+  if(screenMode == 0){ // If screenmode is 0 show the frequency
        if(isSet){
   
       u8g2.setFont(u8g2_font_fub30_tr);
@@ -267,7 +281,7 @@ void drawScreen(){
  
   }
   }
-  else{                // Eğer ekran nota gösterme modunda ise büyük harflerle notayı ekrana yazdır
+  else{                // Print the note to screen when changed
     u8g2.setCursor(12,39);
     u8g2.setFont(u8g2_font_fub30_tr);
     notayiYazdir();
@@ -300,8 +314,8 @@ void notayiYazdir(){
       }
   }
 
-void changeNota(){  // Butona basıldığında aktif olan interrupt. Seçili notayı değiştiriyor
-
+void changeNota(){  // Change the note and if required change the sampling freqency
+  
   if(readyToOperate){
       screenMode = 1;
       screenSayac = millis();
@@ -321,49 +335,31 @@ void changeNota(){  // Butona basıldığında aktif olan interrupt. Seçili not
     
   }  
 void fft(){
-  for(int i = 0; i < SAMPLE_SIZE; i++){  // Örnekleri kompleks diziye aktar
+  for(int i = 0; i < SAMPLE_SIZE; i++){  // Copy the samples to the fft array while reversing bit order
     sinyal[i].set(sample[bitReverse(i)],0);
     }
-  int STEP = 2;                         // İkili gruplardan başla
-  while(STEP != SAMPLE_SIZE*2){
-    for(int m = 0; m < SAMPLE_SIZE/STEP; m++){
-        for(int n = 0; n < STEP/2; n++){
-          int ilkEleman = m*STEP+n;    
-
-          yedek.equal(sinyal[ilkEleman]); // Grubun ilk örneğini daha sonra kullanacağımız için yedekliyoruz
-
-          sinyal[ilkEleman].plus(sinyal[ilkEleman+STEP/2]);  // Grubun birinci örneğine ikinciyi ekle
-          sinyal[ilkEleman+STEP/2].minus(yedek);             // Grubun ikinci örneğinden birinciyi çıkar
-          if(m % 2 != 0){                                    // Grup numarası tek ise omega ile çarp
-                      
-              float omegaAci = -2*(float) n * (SAMPLE_SIZE/2/STEP)*PI/((float)SAMPLE_SIZE);    // w = e^(-2*pi*k/N)
-        
-              omega.fromAngle(omegaAci);
-              sinyal[ilkEleman].times(omega);
-              omegaAci = -2*(float)(n+STEP/2) * (SAMPLE_SIZE/2/STEP)*PI/((float)SAMPLE_SIZE); // w = e^(-2*pi*k/N)
-              omega.fromAngle(omegaAci);
-              sinyal[ilkEleman+STEP/2].times(omega);
-            }
-          
-          }
-      
-      }
-    
-    STEP = STEP*2;                                           // Sıradaki aşamaya geç
+   for(int i = SAMPLE_SIZE/2; i > 0; i=i/2){
+  for(int j = 0; j <  SAMPLE_SIZE / i / 2; j++){
+    for(int z = 0; z < i; z++){
+      yedek.equal(sinyal[z + 2 * j * i]);
+      sinyal[z + 2 * j * i].plus(sinyal[z + 2 * j * i + i]);
+      sinyal[z + 2 * j * i + i].minus(yedek);
+      omega.fromAngle(-2 * PI * (SAMPLE_SIZE / i / 2 * z) / SAMPLE_SIZE);
+      sinyal[z + 2 * j * i + i].times(omega);
     }
-
-    
   }
+}
+}
 
 
 
 
-void FFT(){ // fft alındıktan sonra belirlenen aralıktaki en yüksek genlikli frekansı bul
+void FFT(){  // do fft and find the frequency with highest amplitude
   fft();
   float enyuksek = 25;
-  int enyuksekid = 0;
-  for(int i = notaFrekans[seciliNota]*adaptiveSampleRate - (FREQ_WINDOW + seciliNota * FREQ_WINDOW_GROW)*adaptiveSampleRate; i < notaFrekans[seciliNota]*adaptiveSampleRate + (FREQ_WINDOW + seciliNota * FREQ_WINDOW_GROW)*adaptiveSampleRate; i++){ 
-    float b = sqrt(sinyal[i].real * sinyal[i].real + sinyal[i].img * sinyal[i].img) / SAMPLE_SIZE * 2;
+  int enyuksekid = 0; 
+  for(int i = notaFrekans[seciliNota]*adaptiveSampleRate - (FREQ_WINDOW + seciliNota * FREQ_WINDOW_GROW)*adaptiveSampleRate; i < notaFrekans[seciliNota]*adaptiveSampleRate + (FREQ_WINDOW + seciliNota * FREQ_WINDOW_GROW)*adaptiveSampleRate; i++){ // Only scan within +-15hz
+    float b = sqrt(sinyal[i].real * sinyal[i].real + sinyal[i].img * sinyal[i].img) / SAMPLE_SIZE * 2; 
     if(b > enyuksek){
       enyuksekid = i;
       enyuksek = b;
@@ -382,12 +378,12 @@ void FFT(){ // fft alındıktan sonra belirlenen aralıktaki en yüksek genlikli
 
 
 
-void TIMER_HANDLER(void){ //976 mikrosaniyede bir ateşlenen interrupt. Her interrupt'da bir örnek
+void TIMER_HANDLER(void){ // Interrupt that takes the samples
 
-  int okunan = analogRead(MIC_IN); // Örneği al
-  sampling[sampling_counter] = okunan - 2048; // Örnek Vcc/2 DC bileşene sahip olduğu için çıkar
-  sampling_counter++;                         // Alınan örnek sayısını arttır
-  if(sampling_counter == SAMPLING_SIZE){      // Yeterince örnek alındıysa diziyi büyük dizinin sonuna aktar
+  int okunan = analogRead(MIC_IN); // Take sample
+  sampling[sampling_counter] = okunan - 2048; // Subtract the offset
+  sampling_counter++;                         
+  if(sampling_counter == SAMPLING_SIZE){      // If we took enough samples then pass the samples to the input array for fft
     sampling_counter = 0;
     for(int i = 0; i < SAMPLE_SIZE; i++){
       if(i < SAMPLE_SIZE - SAMPLING_SIZE){
@@ -396,7 +392,7 @@ void TIMER_HANDLER(void){ //976 mikrosaniyede bir ateşlenen interrupt. Her inte
           sample[i] = sampling[i+SAMPLING_SIZE-SAMPLE_SIZE];
           }
       }
-      FFTavailable = true;                // Yeterince örnek alındı
+      FFTavailable = true;                // Ready for fft
       //Serial.println((millis()-sayac));
 
     
@@ -407,7 +403,7 @@ void TIMER_HANDLER(void){ //976 mikrosaniyede bir ateşlenen interrupt. Her inte
 
 
   
-int kacBit(int a){             // Bit ters çevirme işlemi için örnek sayısının kaç bitle temsil edilebileceğini bul
+int kacBit(int a){             // Find the bit length of the samplesize for bit reversing
   int b = 0;
   while(a != 1){
     a = a/2;
